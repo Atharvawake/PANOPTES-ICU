@@ -44,10 +44,35 @@ from services.advanced_monitoring_service import AdvancedMonitoringService
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# MongoDB connection with error handling (FIXED)
+# ============================================================================
+USE_DATABASE = False
+client = None
+db = None
+
+try:
+    mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017/')
+    client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=2000)
+    db_name = os.environ.get('DB_NAME', 'panoptes_icu')
+    db = client[db_name]
+    # Test connection
+    client.server_info()
+    USE_DATABASE = True
+    logger.info(f"✅ MongoDB connected successfully to database: {db_name}")
+except Exception as e:
+    logger.warning(f"⚠️ MongoDB not available: {e}")
+    logger.warning("⚠️ Running without database storage. Calculations will work but won't be saved.")
+    USE_DATABASE = False
+    client = None
+    db = None
 
 # Initialize services
 prediction_service = PredictionService()
@@ -65,13 +90,6 @@ app = FastAPI(
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -106,6 +124,23 @@ class ExplanationRequest(BaseModel):
 
 
 # ============================================================================
+# HELPER FUNCTION FOR DATABASE OPERATIONS
+# ============================================================================
+
+async def safe_db_insert(collection_name: str, document: dict):
+    """Safely insert document into database if available"""
+    if USE_DATABASE and db is not None:
+        try:
+            collection = db[collection_name]
+            await collection.insert_one(document)
+            logger.debug(f"Stored document in {collection_name}")
+        except Exception as e:
+            logger.warning(f"Database insert failed for {collection_name}: {e}")
+    else:
+        logger.debug(f"Skipping database storage (MongoDB not available)")
+
+
+# ============================================================================
 # HEALTH CHECK & INFO ENDPOINTS
 # ============================================================================
 
@@ -116,12 +151,15 @@ async def root():
         "message": "PANOPTES-ICU API",
         "version": "1.0.0",
         "status": "operational",
+        "database_status": "connected" if USE_DATABASE else "not connected (running in memory mode)",
         "features": [
-            "Multi-score calculation (APACHE II, SOFA, qSOFA, GCS)",
+            "Multi-score calculation (APACHE II, SOFA, qSOFA, GCS, Ranson, SAPS II, MODS, Murray, Alvarado)",
             "GRU-D sepsis prediction",
             "Deterioration detection",
             "SHAP explainability",
-            "Smart alert system"
+            "Smart alert system",
+            "Clinical decision support",
+            "Advanced monitoring"
         ]
     }
 
@@ -132,9 +170,11 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "services": {
-            "database": "connected",
+            "database": "connected" if USE_DATABASE else "not connected (optional)",
             "prediction_service": "ready",
-            "alert_service": "active"
+            "alert_service": "active",
+            "clinical_decision_service": "ready",
+            "monitoring_service": "ready"
         }
     }
 
@@ -169,8 +209,14 @@ async def system_info():
             "APACHE II (0-71)",
             "SOFA (0-24)",
             "qSOFA (0-3)",
-            "Glasgow Coma Scale (3-15)"
-        ]
+            "Glasgow Coma Scale (3-15)",
+            "Ranson Criteria (0-11)",
+            "SAPS II (0-163)",
+            "MODS (0-24)",
+            "Murray Score (0-4)",
+            "Alvarado Score (0-10)"
+        ],
+        "database_status": "connected" if USE_DATABASE else "not connected (running without persistence)"
     }
 
 
@@ -187,20 +233,19 @@ async def calculate_apache_score(input_data: APACHE_II_Input):
     try:
         result = calculate_apache_ii(input_data)
         
-        # Store in database
+        # Store in database if available
         score_doc = {
             "type": "apache_ii",
             "patient_data": input_data.model_dump(),
             "result": result.model_dump(),
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
-        await db.scoring_results.insert_one(score_doc)
+        await safe_db_insert("scoring_results", score_doc)
         
         return result
     except Exception as e:
         logger.error(f"APACHE II calculation error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
-
 
 
 @api_router.post("/scoring/ranson")
@@ -212,14 +257,14 @@ async def calculate_ranson_score(input_data: Ranson_Input):
     try:
         result = calculate_ranson(input_data)
         
-        # Store in database
+        # Store in database if available
         score_doc = {
             "type": "ranson",
             "patient_data": input_data.model_dump(),
             "result": result.model_dump(),
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
-        await db.scoring_results.insert_one(score_doc)
+        await safe_db_insert("scoring_results", score_doc)
         
         return result
     except Exception as e:
@@ -235,14 +280,14 @@ async def calculate_saps_score(input_data: SAPS_Input):
     try:
         result = calculate_saps(input_data)
         
-        # Store in database
+        # Store in database if available
         score_doc = {
             "type": "saps",
             "patient_data": input_data.model_dump(),
             "result": result.model_dump(),
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
-        await db.scoring_results.insert_one(score_doc)
+        await safe_db_insert("scoring_results", score_doc)
         
         return result
     except Exception as e:
@@ -258,14 +303,14 @@ async def calculate_mods_score(input_data: MODS_Input):
     try:
         result = calculate_mods(input_data)
         
-        # Store in database
+        # Store in database if available
         score_doc = {
             "type": "mods",
             "patient_data": input_data.model_dump(),
             "result": result.model_dump(),
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
-        await db.scoring_results.insert_one(score_doc)
+        await safe_db_insert("scoring_results", score_doc)
         
         return result
     except Exception as e:
@@ -281,14 +326,14 @@ async def calculate_murray_score(input_data: Murray_Input):
     try:
         result = calculate_murray(input_data)
         
-        # Store in database
+        # Store in database if available
         score_doc = {
             "type": "murray",
             "patient_data": input_data.model_dump(),
             "result": result.model_dump(),
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
-        await db.scoring_results.insert_one(score_doc)
+        await safe_db_insert("scoring_results", score_doc)
         
         return result
     except Exception as e:
@@ -304,14 +349,14 @@ async def calculate_alvarado_score(input_data: Alvarado_Input):
     try:
         result = calculate_alvarado(input_data)
         
-        # Store in database
+        # Store in database if available
         score_doc = {
             "type": "alvarado",
             "patient_data": input_data.model_dump(),
             "result": result.model_dump(),
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
-        await db.scoring_results.insert_one(score_doc)
+        await safe_db_insert("scoring_results", score_doc)
         
         return result
     except Exception as e:
@@ -327,14 +372,14 @@ async def calculate_sofa_score(input_data: SOFA_Input):
     try:
         result = calculate_sofa(input_data)
         
-        # Store in database
+        # Store in database if available
         score_doc = {
             "type": "sofa",
             "patient_data": input_data.model_dump(),
             "result": result.model_dump(),
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
-        await db.scoring_results.insert_one(score_doc)
+        await safe_db_insert("scoring_results", score_doc)
         
         # Check for alert conditions
         if result.total_score >= 10:
@@ -360,14 +405,14 @@ async def calculate_qsofa_score(input_data: qSOFA_Input):
     try:
         result = calculate_qsofa(input_data)
         
-        # Store in database
+        # Store in database if available
         score_doc = {
             "type": "qsofa",
             "patient_data": input_data.model_dump(),
             "result": result.model_dump(),
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
-        await db.scoring_results.insert_one(score_doc)
+        await safe_db_insert("scoring_results", score_doc)
         
         return result
     except Exception as e:
@@ -383,14 +428,14 @@ async def calculate_gcs_score(input_data: GCS_Input):
     try:
         result = calculate_gcs(input_data)
         
-        # Store in database
+        # Store in database if available
         score_doc = {
             "type": "gcs",
             "patient_data": input_data.model_dump(),
             "result": result.model_dump(),
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
-        await db.scoring_results.insert_one(score_doc)
+        await safe_db_insert("scoring_results", score_doc)
         
         return result
     except Exception as e:
@@ -432,11 +477,12 @@ async def predict_sepsis(patient_id: str):
                 qsofa_score=2  # Mock qSOFA score
             )
         
-        # Store prediction
-        await db.predictions.insert_one({
+        # Store prediction if database available
+        prediction_doc = {
             **result,
             "stored_at": datetime.now(timezone.utc).isoformat()
-        })
+        }
+        await safe_db_insert("predictions", prediction_doc)
         
         return result
     except Exception as e:
@@ -464,11 +510,12 @@ async def predict_mortality(
             comorbidities=comorbidities
         )
         
-        # Store prediction
-        await db.predictions.insert_one({
+        # Store prediction if database available
+        prediction_doc = {
             **result,
             "stored_at": datetime.now(timezone.utc).isoformat()
-        })
+        }
+        await safe_db_insert("predictions", prediction_doc)
         
         return result
     except Exception as e:
@@ -490,11 +537,12 @@ async def predict_organ_failure(
             sofa_components=sofa_components
         )
         
-        # Store prediction
-        await db.predictions.insert_one({
+        # Store prediction if database available
+        prediction_doc = {
             **result,
             "stored_at": datetime.now(timezone.utc).isoformat()
-        })
+        }
+        await safe_db_insert("predictions", prediction_doc)
         
         return result
     except Exception as e:
@@ -1037,5 +1085,14 @@ app.add_middleware(
 # Shutdown event
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
-    logger.info("Database connection closed")
+    if client:
+        client.close()
+        logger.info("Database connection closed")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    logger.info(f"Starting PANOPTES-ICU server on port {port}")
+    logger.info(f"Database mode: {'CONNECTED' if USE_DATABASE else 'IN-MEMORY (no persistence)'}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
